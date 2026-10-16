@@ -21,10 +21,11 @@ import (
 	"github.com/geekaara/algorithmic-triage/internal/triage"
 )
 
-const usage = `usage: triage <plan|apply> [flags]
+const usage = `usage: triage <plan|apply|reset> [flags]
 
   plan   -policy context/mvp.md -out plan.json -refresh
-  apply  -plan plan.json`
+  apply  -plan plan.json
+  reset  [-yes]   undo apply (shows what it would do unless -yes)`
 
 // Gemini models in order of preference; later ones absorb overload errors.
 var models = []string{"gemini-3.8-flash", "gemini-3.7-flash", "gemini-flash-latest", "gemini-3.5-flash", "gemini-3.1-flash-lite"}
@@ -63,6 +64,11 @@ func main() {
 		in := fs.String("plan", "plan.json", "plan written by `triage plan`")
 		fs.Parse(os.Args[2:])
 		err = runApply(ctx, jc, cfg["JIRA_PROJECT"], *in)
+	case "reset":
+		fs := flag.NewFlagSet("reset", flag.ExitOnError)
+		yes := fs.Bool("yes", false, "actually undo; without it, only show what would change")
+		fs.Parse(os.Args[2:])
+		err = runReset(ctx, jc, cfg["JIRA_PROJECT"], *yes)
 	default:
 		fmt.Fprintln(os.Stderr, usage)
 		os.Exit(2)
@@ -300,6 +306,122 @@ func runApply(ctx context.Context, jc *jira.Client, project, path string) error 
 		fmt.Printf("  %s AT RISK\n", it.ID())
 	}
 	fmt.Printf("\n  Applied %s to %s.\n", path, project)
+	return nil
+}
+
+const (
+	commentPrefix = "Algorithmic triage"
+	goalSuffix    = "planned by algorithmic triage"
+)
+
+// runReset undoes what apply did, so a demo or test can be run again. It
+// only touches what apply creates: its labels, sprint moves, sprint goals,
+// model estimates and its own comments. Tickets created by a split are
+// listed but never deleted.
+func runReset(ctx context.Context, jc *jira.Client, project string, yes bool) error {
+	board, err := jc.ScrumBoard(ctx, project)
+	if err != nil {
+		return err
+	}
+	pointsField, err := jc.EstimationField(ctx, board)
+	if err != nil {
+		return err
+	}
+
+	triaged, err := jc.SearchIssues(ctx, fmt.Sprintf("project = %s AND labels = %s ORDER BY key", project, "ai-triaged"), []string{"summary", "description"})
+	if err != nil {
+		return err
+	}
+	inSprints, err := jc.SearchIssues(ctx, fmt.Sprintf("project = %s AND labels = %s AND sprint IN futureSprints()", project, "ai-triaged"), []string{"summary"})
+	if err != nil {
+		return err
+	}
+	// Comments can outlive labels (for example after a manual undo), so look
+	// for ours on every ticket in the project.
+	all, err := jc.SearchIssues(ctx, fmt.Sprintf("project = %s AND issuetype != Epic ORDER BY key", project), []string{"summary"})
+	if err != nil {
+		return err
+	}
+
+	type commentRef struct{ key, id string }
+	var comments []commentRef
+	var unestimate []string
+	for _, is := range all {
+		cs, err := jc.Comments(ctx, is.Key)
+		if err != nil {
+			return err
+		}
+		estimated := false
+		for _, c := range cs {
+			if strings.HasPrefix(c.Text, commentPrefix) {
+				comments = append(comments, commentRef{is.Key, c.ID})
+				estimated = estimated || strings.Contains(c.Text, "by the model; please review")
+			}
+		}
+		if estimated {
+			unestimate = append(unestimate, is.Key)
+		}
+	}
+	var splits []string
+	for _, is := range triaged {
+		if strings.Contains(jira.PlainText(is.Fields["description"]), "split by algorithmic triage") {
+			splits = append(splits, is.Key)
+		}
+	}
+
+	sprints, err := jc.Sprints(ctx, board)
+	if err != nil {
+		return err
+	}
+	var goals []jira.Sprint
+	for _, s := range sprints {
+		if s.State == "future" && strings.HasSuffix(s.Goal, goalSuffix) {
+			goals = append(goals, s)
+		}
+	}
+
+	moveKeys := make([]string, len(inSprints))
+	for i, is := range inSprints {
+		moveKeys[i] = is.Key
+	}
+	fmt.Printf("\n%s  %s\n\n", bold("Reset"), project)
+	fmt.Printf("  %-26s %d %s\n", "Move back to backlog", len(moveKeys), dim(strings.Join(moveKeys, " ")))
+	fmt.Printf("  %-26s %d tickets\n", "Remove triage labels", len(triaged))
+	fmt.Printf("  %-26s %d\n", "Delete triage comments", len(comments))
+	fmt.Printf("  %-26s %d %s\n", "Clear model estimates", len(unestimate), dim(strings.Join(unestimate, " ")))
+	fmt.Printf("  %-26s %d\n", "Clear sprint goals", len(goals))
+	if len(splits) > 0 {
+		fmt.Printf("  %-26s %s\n", "Split tickets (kept)", strings.Join(splits, " ")+dim("  delete by hand if you no longer want them"))
+	}
+	if !yes {
+		fmt.Printf("\n  Nothing changed. Run %s to do it.\n\n", bold("triage reset -yes"))
+		return nil
+	}
+
+	if err := jc.MoveToBacklog(ctx, moveKeys); err != nil {
+		return err
+	}
+	for _, c := range comments {
+		if err := jc.DeleteComment(ctx, c.key, c.id); err != nil {
+			return err
+		}
+	}
+	for _, k := range unestimate {
+		if err := jc.EditIssue(ctx, k, map[string]any{"fields": map[string]any{pointsField: nil}}); err != nil {
+			return err
+		}
+	}
+	for _, is := range triaged {
+		if err := jc.RemoveLabels(ctx, is.Key, "ai-triaged", "mvp", "v2", "deadline-at-risk"); err != nil {
+			return err
+		}
+	}
+	for _, s := range goals {
+		if err := jc.UpdateSprint(ctx, s.ID, map[string]any{"goal": ""}); err != nil {
+			return err
+		}
+	}
+	fmt.Printf("\n  %s Run %s to see the plan again.\n\n", green("✔ Reset done."), bold("triage plan"))
 	return nil
 }
 
