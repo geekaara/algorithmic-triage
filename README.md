@@ -120,3 +120,7 @@ Go, standard library only, no dependencies. `go test ./...` runs the planner tes
 | `context/mvp.md` | Example policy |
 
 More options: `./bin/triage plan -h`.
+
+## License
+
+[MIT](LICENSE): free to use, change and share, including commercially. Contributions and issues welcome.
