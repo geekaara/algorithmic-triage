@@ -2,3 +2,4 @@
 .triage-cache/
 plan.json
 bin/
+plan-*.json

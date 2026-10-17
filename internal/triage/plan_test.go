@@ -137,3 +137,31 @@ func TestBuildPlan_UnestimatedUsesModelEstimate(t *testing.T) {
 		t.Fatalf("got %+v", it)
 	}
 }
+
+func TestBuildPlan_SplitBlockerIsNotPulledInTwice(t *testing.T) {
+	b := board(
+		Ticket{Key: "BALANCES", Points: 5},
+		Ticket{Key: "SETTLE", Points: 2, BlockedBy: []string{"BALANCES"}},
+	)
+	b.Future = []jira.Sprint{{ID: 5, Name: "S5"}, {ID: 6, Name: "S6"}}
+	ds := map[string]Decision{
+		"BALANCES": {Verdict: Split, SplitSummary: "Basic balances", SplitPoints: 3, GoldenPathStep: 4},
+		"SETTLE":   {Verdict: MVP, GoldenPathStep: 4},
+	}
+	p, err := BuildPlan(b, ds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, s := range p.Sprints {
+		for _, it := range s.Items {
+			ids = append(ids, it.ID())
+		}
+	}
+	if len(ids) != 2 || ids[0] != "new:BALANCES" || ids[1] != "SETTLE" {
+		t.Fatalf("want the slice then SETTLE, got %v", ids)
+	}
+	if got := p.MVPPoints(); got != 5 {
+		t.Fatalf("MVP points = %v, want 5 (3-pt slice + 2)", got)
+	}
+}

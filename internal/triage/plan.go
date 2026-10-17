@@ -146,6 +146,9 @@ func BuildPlan(b *Board, ds map[string]Decision) (Plan, error) {
 			if _, already := mvp[blocker]; already || !isCandidate {
 				continue
 			}
+			if _, sliced := mvp["new:"+blocker]; sliced {
+				continue // the blocker was split; its MVP slice is already planned
+			}
 			d := ds[blocker]
 			it := itemFor(t, d)
 			it.PulledBy = mvp[id].ID()
@@ -161,8 +164,10 @@ func BuildPlan(b *Board, ds map[string]Decision) (Plan, error) {
 	for _, it := range order {
 		earliest := 0
 		for _, bk := range it.BlockedBy {
-			if si, ok := placed[bk]; ok && si > earliest {
-				earliest = si
+			for _, id := range []string{bk, "new:" + bk} {
+				if si, ok := placed[id]; ok && si > earliest {
+					earliest = si
+				}
 			}
 		}
 		done := false
@@ -224,8 +229,10 @@ func schedule(items map[string]Item) []Item {
 		}
 		visiting[it.ID()] = true
 		for _, bk := range it.BlockedBy {
-			if dep, ok := items[bk]; ok {
-				visit(dep)
+			for _, id := range []string{bk, "new:" + bk} {
+				if dep, ok := items[id]; ok {
+					visit(dep)
+				}
 			}
 		}
 		emitted[it.ID()] = true

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/geekaara/algorithmic-triage/internal/gemini"
@@ -28,6 +29,7 @@ type Decision struct {
 	V2Items        []string `json:"v2_items,omitempty"`
 	Confidence     float64  `json:"confidence"`
 	Model          string   `json:"model,omitempty"`
+	Escalated      bool     `json:"escalated,omitempty"` // decided by the LLM after the decision model was unsure
 }
 
 const (
@@ -205,4 +207,96 @@ func describe(t Ticket, b *Board) string {
 		related("Blocked by", t.BlockedBy)
 	}
 	return sb.String()
+}
+
+// Explanations. When the decision model has already made a confident call,
+// the LLM only writes the human-readable reason: it is better at language,
+// and it cannot change the verdict.
+
+var explainSchema = map[string]any{
+	"type": "OBJECT",
+	"properties": map[string]any{
+		"reasons": map[string]any{
+			"type": "ARRAY",
+			"items": map[string]any{
+				"type": "OBJECT",
+				"properties": map[string]any{
+					"key":       map[string]any{"type": "STRING"},
+					"reason":    map[string]any{"type": "STRING", "description": "One or two plain sentences explaining the decision, quoting the policy line. If you object, say why instead."},
+					"objection": map[string]any{"type": "BOOLEAN", "description": "True only if the decision clearly contradicts the MVP policy."},
+				},
+				"required":         []string{"key", "reason", "objection"},
+				"propertyOrdering": []string{"key", "reason", "objection"},
+			},
+		},
+	},
+	"required": []string{"reasons"},
+}
+
+const explainInstructions = `You write the explanation for triage decisions that a classifier has already made.
+
+For each ticket, write one or two plain sentences a team member would accept: why the ticket is MVP or V2, quoting the specific line of the MVP policy given. Be concrete about what in the ticket makes it so. No hedging.
+
+Do not rationalise a wrong call. If, and only if, the decision clearly contradicts the MVP policy (for example, it marks as MVP something no golden-path step or non-negotiable needs), set "objection" to true and use "reason" to say why. Otherwise set "objection" to false.
+
+MVP policy:
+---
+%s
+---`
+
+// Explanation is the LLM's write-up of a decision it did not make.
+type Explanation struct {
+	Reason    string
+	Objection bool // the LLM thinks the decision contradicts the policy
+}
+
+// Explain writes the reason for each decision without re-judging it, and
+// flags any decision that clearly contradicts the policy.
+func (j *Judge) Explain(ctx context.Context, b *Board, ds map[string]Decision) (map[string]Explanation, error) {
+	system := fmt.Sprintf(explainInstructions, j.Policy)
+	out := map[string]Explanation{}
+	prompts := map[string]string{}
+	var pending []string
+	for key, d := range ds {
+		t := b.All[key]
+		prompts[key] = fmt.Sprintf("%s\nDecision: %s\nPolicy line: %s\n", describe(t, b), d.Verdict, d.Rule)
+		if c, ok := j.cached("explain\x00"+system, prompts[key]); ok && !j.Refresh && c.Reason != "" {
+			out[key] = Explanation{Reason: c.Reason, Objection: c.Verdict == "OBJECT"}
+			continue
+		}
+		pending = append(pending, key)
+	}
+	sort.Strings(pending)
+
+	for len(pending) > 0 {
+		n := min(batchSize, len(pending))
+		batch := pending[:n]
+		pending = pending[n:]
+		var sb strings.Builder
+		fmt.Fprintf(&sb, "Explain each of these %d decisions. Return one reason per ticket, with its key.\n", n)
+		for i, key := range batch {
+			fmt.Fprintf(&sb, "\n=== Ticket %d of %d ===\n%s", i+1, n, prompts[key])
+		}
+		var res struct {
+			Reasons []struct {
+				Key       string `json:"key"`
+				Reason    string `json:"reason"`
+				Objection bool   `json:"objection"`
+			} `json:"reasons"`
+		}
+		if _, err := j.Gemini.GenerateJSON(ctx, system, sb.String(), explainSchema, &res); err != nil {
+			return out, err
+		}
+		for _, r := range res.Reasons {
+			if _, asked := prompts[r.Key]; asked && r.Reason != "" {
+				out[r.Key] = Explanation{Reason: r.Reason, Objection: r.Objection}
+				cached := Decision{Reason: r.Reason}
+				if r.Objection {
+					cached.Verdict = "OBJECT"
+				}
+				j.store("explain\x00"+system, prompts[r.Key], cached)
+			}
+		}
+	}
+	return out, nil
 }

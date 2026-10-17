@@ -19,11 +19,12 @@ import (
 	"github.com/geekaara/algorithmic-triage/internal/gemini"
 	"github.com/geekaara/algorithmic-triage/internal/jira"
 	"github.com/geekaara/algorithmic-triage/internal/triage"
+	"github.com/geekaara/algorithmic-triage/internal/typesafe"
 )
 
 const usage = `usage: triage <plan|apply|reset> [flags]
 
-  plan   -policy context/mvp.md -out plan.json -refresh
+  plan   -policy context/mvp.md -out plan.json -refresh -judge gemini|jev|combined
   apply  -plan plan.json
   reset  [-yes]   undo apply (shows what it would do unless -yes)`
 
@@ -48,17 +49,60 @@ func main() {
 	case "plan":
 		fs := flag.NewFlagSet("plan", flag.ExitOnError)
 		policy := fs.String("policy", "context/mvp.md", "MVP definition the model judges against")
-		out := fs.String("out", "plan.json", "where to write the plan")
+		out := fs.String("out", "", "where to write the plan (default plan.json, or plan-jev.json with -judge jev)")
 		refresh := fs.Bool("refresh", false, "ignore cached model answers")
+		judgeName := fs.String("judge", "gemini", "who decides MVP/V2/split: gemini, jev (a decision model via Vercel AI Gateway), or combined (jev, escalating unsure tickets to gemini)")
+		minConf := fs.Float64("min-confidence", 0.7, "with -judge combined: escalate tickets below this decision-model confidence")
 		fs.Parse(os.Args[2:])
-		key := os.Getenv("GEMINI_API_KEY")
-		if key == "" {
-			log.Fatal("missing GEMINI_API_KEY (see .env.example)")
-		}
 		if m := os.Getenv("GEMINI_MODEL"); m != "" {
 			models = append([]string{m}, models...)
 		}
-		err = runPlan(ctx, jc, gemini.New(key, models...), cfg["JIRA_PROJECT"], *policy, *out, *refresh)
+		var gc *gemini.Client
+		if key := os.Getenv("GEMINI_API_KEY"); key != "" {
+			gc = gemini.New(key, models...)
+		}
+		var judge decider
+		var label string
+		switch *judgeName {
+		case "gemini":
+			if gc == nil {
+				log.Fatal("missing GEMINI_API_KEY (see .env.example)")
+			}
+			judge, label = &triage.Judge{Gemini: gc, CacheDir: ".triage-cache", Refresh: *refresh}, "Gemini"
+			if *out == "" {
+				*out = "plan.json"
+			}
+		case "jev", "combined":
+			key := os.Getenv("AI_GATEWAY_API_KEY")
+			if key == "" {
+				log.Fatal("missing AI_GATEWAY_API_KEY (see .env.example)")
+			}
+			model := os.Getenv("JEV_MODEL")
+			if model == "" {
+				model = "typesafe-ai/jev"
+			}
+			dj := &triage.DecisionJudge{Model: typesafe.New(typesafe.DefaultBaseURL, key, model), CacheDir: ".triage-cache", Refresh: *refresh}
+			if gc != nil {
+				dj.Text = &triage.Judge{Gemini: gc, CacheDir: ".triage-cache"}
+			}
+			judge, label = dj, model
+			if *out == "" {
+				*out = "plan-jev.json"
+			}
+			if *judgeName == "combined" {
+				if gc == nil {
+					log.Fatal("-judge combined also needs GEMINI_API_KEY")
+				}
+				judge = &triage.CombinedJudge{Fast: dj, Slow: dj.Text, MinConfidence: *minConf}
+				label = fmt.Sprintf("%s, escalating to Gemini below p=%.2f", model, *minConf)
+				if *out == "plan-jev.json" {
+					*out = "plan-combined.json"
+				}
+			}
+		default:
+			log.Fatalf("unknown -judge %q: use gemini or jev", *judgeName)
+		}
+		err = runPlan(ctx, jc, judge, label, cfg["JIRA_PROJECT"], *policy, *out)
 	case "apply":
 		fs := flag.NewFlagSet("apply", flag.ExitOnError)
 		in := fs.String("plan", "plan.json", "plan written by `triage plan`")
@@ -78,7 +122,13 @@ func main() {
 	}
 }
 
-func runPlan(ctx context.Context, jc *jira.Client, gc *gemini.Client, project, policyPath, out string, refresh bool) error {
+// decider is anything that can judge every candidate ticket: an LLM
+// (Gemini) or a decision model (Jev).
+type decider interface {
+	DecideAll(ctx context.Context, b *triage.Board, progress func(triage.Decision)) (map[string]triage.Decision, error)
+}
+
+func runPlan(ctx context.Context, jc *jira.Client, judge decider, label, project, policyPath, out string) error {
 	policy, err := os.ReadFile(policyPath)
 	if err != nil {
 		return err
@@ -100,12 +150,32 @@ func runPlan(ctx context.Context, jc *jira.Client, gc *gemini.Client, project, p
 		return nil
 	}
 
-	fmt.Printf("  %-10s judging %d tickets with Gemini ", dim("Judge"), len(b.Candidates))
-	j := &triage.Judge{Gemini: gc, Policy: string(policy), CacheDir: ".triage-cache", Refresh: refresh}
-	ds, err := j.DecideAll(ctx, b, func(triage.Decision) { fmt.Print(".") })
+	fmt.Printf("  %-10s judging %d tickets with %s ", dim("Judge"), len(b.Candidates), label)
+	switch j := judge.(type) {
+	case *triage.Judge:
+		j.Policy = string(policy)
+	case *triage.DecisionJudge:
+		j.Policy = string(policy)
+		if j.Text != nil {
+			j.Text.Policy = string(policy)
+		}
+	case *triage.CombinedJudge:
+		j.Fast.Policy = string(policy)
+		j.Slow.Policy = string(policy)
+	}
+	ds, err := judge.DecideAll(ctx, b, func(triage.Decision) { fmt.Print(".") })
 	fmt.Println()
 	if err != nil {
 		return err
+	}
+	if _, ok := judge.(*triage.CombinedJudge); ok {
+		var esc []string
+		for _, t := range b.Candidates {
+			if ds[t.Key].Escalated {
+				esc = append(esc, t.Key)
+			}
+		}
+		fmt.Printf("  %-10s decision model decided %d, escalated %d to Gemini %s\n", dim("Combined"), len(b.Candidates)-len(esc), len(esc), dim(strings.Join(esc, " ")))
 	}
 	p, err := triage.BuildPlan(b, ds)
 	if err != nil {

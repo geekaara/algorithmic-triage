@@ -56,10 +56,11 @@ func (c *Client) GenerateJSON(ctx context.Context, system, user string, schema m
 				return version, nil
 			}
 			lastErr = err
-			if status != http.StatusTooManyRequests && status < 500 {
+			// status 0 means a network error or timeout: retry like an overload.
+			if status != 0 && status != http.StatusTooManyRequests && status < 500 {
 				return "", err // not transient
 			}
-			if status >= 500 && attempt >= 2 {
+			if (status == 0 || status >= 500) && attempt >= 2 {
 				break // overloaded; move on to the next model
 			}
 			wait := time.Duration(attempt+1) * 2 * time.Second
